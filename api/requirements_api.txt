@@ -1,0 +1,19 @@
+# quipux_api — dependencias
+# Instalar: pip install -r requirements.txt
+
+# --- API ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9      # necesario para UploadFile
+
+# --- Tu extractor (mismas versiones que quipux_extractor.py) ---
+pdfplumber==0.11.4
+spacy==3.7.5
+torch==2.3.1
+sentence-transformers==3.0.1
+transformers==4.44.2
+rapidfuzz==3.9.7
+dateparser==1.2.0
+
+# --- spaCy model (instalar aparte) ---
+# python -m spacy download es_core_news_sm

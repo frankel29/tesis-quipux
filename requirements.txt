@@ -1,0 +1,33 @@
+# ============================================================
+# requirements.txt — Quipux NER API
+# Tesis: Generación de borradores RAG para sistema Quipux
+# ============================================================
+
+# --- API ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+
+# --- Extracción de PDF ---
+pdfplumber==0.11.4
+
+# --- NLP base ---
+spacy==3.7.5
+es-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/es_core_news_sm-3.7.0/es_core_news_sm-3.7.0-py3-none-any.whl
+
+# --- Transformers / BETO ---
+transformers==4.44.2
+torch==2.4.1
+tokenizers==0.19.1
+
+# --- Embeddings semánticos ---
+sentence-transformers==3.1.1
+
+# --- Fuzzy matching ---
+rapidfuzz==3.9.7
+
+# --- Parseo de fechas ---
+dateparser==1.2.0
+
+# --- Utilidades ---
+numpy==1.26.4
