@@ -1,21 +1,31 @@
 """
-quipux_extractor.py  —  v4
+quipux_extractor.py  —  v6
 ==========================
 Extractor NER para documentos Quipux (PDF → JSON enriquecido).
-Implementa la Matriz de Selección Tecnológica NER v2.
 
-Cambios v4 respecto a v3
+Schema de salida v5 (4 bloques estructurados para RAG):
+  METADATOS:           tipo_documento, numero_documento, fecha_documento, asunto,
+                       institucion_emisora, institucion_destino,
+                       firmante, cargo_firmante
+  CONTENIDO_FUNCIONAL: objeto_tramite, accion_principal, solicitudes,
+                       acciones_requeridas, problemas_juridicos,
+                       hechos_relevantes, documentos_mencionados
+  NORMATIVA:           normativa_principal, referencias_normativas,
+                       articulos_mencionados
+  ENTIDADES:           personas, instituciones, cargos, fechas_relevantes,
+                       referencias_documentales
+
+Cambios v5 respecto a v4
 -------------------------
-  - Módulo ASUNTO eliminado completamente (campo, embedding y extracción)
-  - PERSONA: capa 1.5 de búsqueda contextual post-tratamiento sin ML
-  - CARGO:   catálogo ampliado + detección de cargo_firmante por línea adyacente
-  - ORG_PUBLICA: patrones Ruler más robustos, siglas institucionales añadidas
-  - FECHA: segunda pasada sobre el cuerpo del documento como fallback
-  - BETO: filtro mejorado (threshold score, limpieza de subwords, exclusión de tokens
-          de ruido tipo "Quito", "Ecuador" que BETO etiqueta como PER erróneamente)
-  - FallbackParser: extrae también ORG y LUGAR de cartas BID
-  - QuipuxMetadata: campos asunto/asunto_embedding eliminados
-  - Constantes centralizadas en _CONFIG para fácil mantenimiento
+  - QuipuxMetadata refactorizado a 4 sub-dataclasses anidados
+  - StructuralParser: re-añadido ASUNTO + extracción de institucion_emisora
+                       e institucion_destino vía fuzzy match contra catálogos
+  - EntityExtractor: extract_referencias_split separa normativas/artículos/
+                      documentales + identifica normativa_principal
+  - EntityExtractor: extract_todas_fechas extrae todas las fechas relevantes
+  - SemanticExtractor (NUEVO): LLM API (OpenAI/Azure/Anthropic) para campos
+                                 semánticos sin fine-tuning. Activado con
+                                 QUIPUX_LOAD_LLM=true.
 
 Tipos de documento soportados
 ------------------------------
@@ -29,21 +39,36 @@ Arquitectura
 ------------
   PDFProcessor       extrae texto plano (pdfplumber)
   DocumentClassifier detecta tipo de documento (RegEx, sin ML)
-  StructuralParser   extrae bloques posicionales (PARA, DE, firmante)
+  StructuralParser   extrae bloques posicionales (PARA, DE, firmante, asunto)
   FallbackParser     extrae campos clave-valor de documentos externos
-  EntityExtractor    orquesta los extractores de entidad (Singleton de modelos)
+  EntityExtractor    orquesta los extractores de entidad (spaCy + BETO)
+  SemanticExtractor  LLM API para campos semánticos (opcional)
   MetadataEncoder    serializa a JSON
+
+Variables de entorno LLM
+-------------------------
+  QUIPUX_LOAD_LLM        true|false (default false)
+  QUIPUX_LLM_PROVIDER    openai|anthropic (default openai)
+  QUIPUX_LLM_MODEL       nombre de modelo o deployment Azure (default gpt-4o-mini)
+  QUIPUX_LLM_USE_AZURE   true|false — usar AzureOpenAI (default false)
+  OPENAI_API_KEY         API key directa OpenAI
+  AZURE_OPENAI_ENDPOINT  endpoint Azure
+  AZURE_OPENAI_KEY       API key Azure
+  AZURE_OPENAI_API_VERSION  versión API Azure (default 2024-02-01)
+  ANTHROPIC_API_KEY      API key Anthropic
 
 Uso
 ---
   python quipux_extractor.py oficio.pdf
   python quipux_extractor.py oficio.pdf --output resultado.json
   python quipux_extractor.py oficio.pdf --no-beto
+  python quipux_extractor.py oficio.pdf --llm   (activa SemanticExtractor)
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import argparse
@@ -88,11 +113,23 @@ class _CONFIG:
     # Score mínimo de BETO para aceptar entidad (0–1)
     BETO_SCORE_MIN    = 0.80
 
+    # Regex para filtrar falsos positivos de spaCy PER (títulos, capítulos, términos jurídicos)
+    SPACY_PER_NOISE = re.compile(
+        r"^(?:Capítulo|Código|Resolución|Oficio|Memorando|Licitación|Contrato"
+        r"|Convenio|Reglamento|Artículo|Catálogo|Tercera|Segunda|Primera"
+        r"|Edición|Buenas\s+Prácticas|Así\s+también|Señor\s*$|Señora\s*$"
+        r"|Señorita\s*$)",
+        re.IGNORECASE,
+    )
+
     # Palabras que BETO suele etiquetar erróneamente como PER en docs EC
     BETO_PER_STOPLIST = frozenset({
         "quito", "guayaquil", "cuenca", "ecuador", "quipux", "sercop",
         "señor", "señora", "señorita", "estimado", "presente",
         "consideración", "adjunto", "cordialmente",
+        "oficio", "memorando", "resolución", "circular", "informe",
+        "vivienda", "decisión", "ministerio", "secretaría", "dirección",
+        "anexo", "artículo", "numeral", "literal", "reglamento",
     })
 
 
@@ -101,21 +138,52 @@ class _CONFIG:
 # ===========================================================================
 
 @dataclass
+class MetadatosBlock:
+    tipo_documento: str | None = None
+    numero_documento: str | None = None
+    fecha_documento: str | None = None
+    asunto: str | None = None
+    institucion_emisora: str | None = None
+    institucion_destino: str | None = None
+    firmante: str | None = None
+    cargo_firmante: str | None = None
+
+
+@dataclass
+class ContenidoFuncionalBlock:
+    objeto_tramite: str | None = None
+    accion_principal: str | None = None
+    solicitudes: list[str] = field(default_factory=list)
+    acciones_requeridas: list[str] = field(default_factory=list)
+    problemas_juridicos: list[str] = field(default_factory=list)
+    hechos_relevantes: list[str] = field(default_factory=list)
+    documentos_mencionados: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NormativaBlock:
+    normativa_principal: str | None = None
+    referencias_normativas: list[str] = field(default_factory=list)
+    articulos_mencionados: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EntidadesBlock:
+    personas: list[str] = field(default_factory=list)
+    instituciones: list[str] = field(default_factory=list)
+    cargos: list[str] = field(default_factory=list)
+    fechas_relevantes: list[str] = field(default_factory=list)
+    referencias_documentales: list[str] = field(default_factory=list)
+
+
+@dataclass
 class QuipuxMetadata:
     procesable: bool = True
     motivo_rechazo: str | None = None
-    tipo_documento: str | None = None
-    codigo_documental: str | None = None
-    fecha_iso: str | None = None
-    lugar: list[str] = field(default_factory=list)
-    personas: list[str] = field(default_factory=list)
-    organizaciones: list[str] = field(default_factory=list)
-    cargos: list[str] = field(default_factory=list)
-    referencias_normativas: list[str] = field(default_factory=list)
-    estado: str | None = None
-    accion_requerida: str | None = None
-    accion_clase: str | None = None
-    anexos: list[dict] = field(default_factory=list)
+    METADATOS: MetadatosBlock = field(default_factory=MetadatosBlock)
+    CONTENIDO_FUNCIONAL: ContenidoFuncionalBlock = field(default_factory=ContenidoFuncionalBlock)
+    NORMATIVA: NormativaBlock = field(default_factory=NormativaBlock)
+    ENTIDADES: EntidadesBlock = field(default_factory=EntidadesBlock)
 
 
 @dataclass
@@ -262,6 +330,9 @@ class FallbackParser:
             "firmante_cargo": None,
             "orgs_externas": orgs_externas,
             "kv_extra": kv,
+            "asunto": None,
+            "institucion_emisora": None,
+            "institucion_destino": None,
         }
 
 
@@ -344,6 +415,13 @@ class StructuralParser:
         re.IGNORECASE | re.DOTALL,
     )
 
+    # Asunto del documento (campo Quipux estructurado)
+    RE_ASUNTO = re.compile(
+        r"ASUNTO\s*:\s*(.+?)(?=\n\s*\n|\nDe\s+mi\s+consideraci[oó]n"
+        r"|\nAl\s+respecto|\nEn\s+atenci[oó]n)",
+        re.IGNORECASE | re.DOTALL,
+    )
+
     # Firmante al pie — acepta variantes de cierre
     RE_FIRMANTE = re.compile(
         r"(?:Atentamente|Comuníquese\s+y\s+Publíquese|Con\s+sentimientos"
@@ -392,6 +470,9 @@ class StructuralParser:
             "de_nombres": [], "firmante": None,
             "firmante_cargo": None,
             "orgs_externas": [],
+            "asunto": None,
+            "institucion_emisora": None,
+            "institucion_destino": None,
         }
 
         # Firmante
@@ -410,17 +491,77 @@ class StructuralParser:
                     result["firmante_cargo"] = line
                     break
 
+        # Fallback: firma electrónica en página separada (texto de pie rompe RE_FIRMANTE)
+        if not result["firmante"]:
+            m_df = re.search(
+                r"Documento\s+firmado\s+electr[oó]nicamente\s*\n+",
+                text, re.IGNORECASE,
+            )
+            if m_df:
+                rest_df = text[m_df.end():m_df.end() + 200]
+                m_name = self.RE_NOMBRE_TRAT.search(rest_df[:120])
+                if m_name:
+                    result["firmante"] = m_name.group(0).strip()
+                    for line in rest_df[m_name.end():].splitlines():
+                        line = line.strip()
+                        if line and 4 < len(line) < 120:
+                            result["firmante_cargo"] = line
+                            break
+
+        # Asunto (campo Quipux estructurado)
+        m = self.RE_ASUNTO.search(text)
+        if m:
+            raw = " ".join(m.group(1).split())
+            # Cortar en el primer indicio del bloque PARA (destinatario)
+            # o en un punto que cierre oración seguido de mayúscula
+            cut = re.search(
+                r'\.\s+(?=[A-ZÁÉÍÓÚÑ][a-záéíóúñ])'               # punto + mayúscula
+                r'|[\)\.]\s+(?=Señor[a]?\s+(?:\w+\.?\s+)?[A-ZÁÉÍÓÚÑ])', # ) o . antes de Señor/Señora
+                raw
+            )
+            if cut and cut.start() > 10:
+                raw = raw[:cut.start() + 1]
+            result["asunto"] = raw
+
         # PARA y DE (solo no-Resolución)
         if tipo != "RESOLUCIÓN":
             m = self.RE_PARA.search(text)
             if m:
+                para_block = m.group(1)
                 result["para_nombres"], result["para_cargos"] = \
-                    self._parse_nombres_cargos(m.group(1))
+                    self._parse_nombres_cargos(para_block)
+                result["institucion_destino"] = self._extract_institucion(para_block)
             m = self.RE_DE.search(text)
             if m:
-                result["de_nombres"], _ = self._parse_nombres_cargos(m.group(1))
+                de_block = m.group(1)
+                result["de_nombres"], _ = self._parse_nombres_cargos(de_block)
+                result["institucion_emisora"] = self._extract_institucion(de_block)
 
         return result
+
+    def _extract_institucion(self, block: str) -> str | None:
+        """
+        Identifica la institución dentro de un bloque PARA/DE.
+        Estrategia: línea ALL-CAPS no-nombre + fallback fuzzy match contra catálogos.
+        """
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        # Estrategia 1: línea ALL-CAPS larga sin tratamiento (típico patrón Quipux)
+        for line in lines:
+            if (line.isupper() and len(line) > 6
+                    and not self.RE_NOMBRE_TRAT.search(line)
+                    and not self.RE_CARGO.search(line)):
+                return line
+        # Estrategia 2: fuzzy match contra catálogos institucionales
+        catalog = _Catalogs.ORGS + _Catalogs.SIGLAS_ORGS
+        for line in lines:
+            if self.RE_NOMBRE_TRAT.search(line) or self.RE_CARGO.search(line):
+                continue
+            if len(line) < 4:
+                continue
+            best = fuzz_process.extractOne(line, catalog, score_cutoff=75)
+            if best:
+                return best[0]
+        return None
 
     def _parse_nombres_cargos(self, block: str) -> tuple[list[str], list[str]]:
         nombres: list[str] = []
@@ -705,16 +846,86 @@ class EntityExtractor:
         re.IGNORECASE,
     )
 
-    def extract_referencias(self, text: str) -> list[str]:
-        """E4: Referencias normativas y documentales."""
+    # Sub-clasificadores de referencias (aplicados sobre cada hit de _RE_NORM)
+    _RE_REF_ART = re.compile(r"^[Aa]rt(?:[ií]culo)?\.?\s*\d+", re.IGNORECASE)
+    _RE_REF_DOC = re.compile(
+        r"^(?:Oficio|Memorando|Informe|Circular)\s+(?:Nro?\.?|No\.?|N°)",
+        re.IGNORECASE,
+    )
+    _RE_REF_LEY_PRINCIPAL = re.compile(
+        r"^(?:Ley\s+Org[aá]nica|C[oó]digo\s+Org[aá]nico|C[oó]digo\s+del\s+Trabajo"
+        r"|C[oó]digo\s+Civil|Constituci[oó]n)",
+        re.IGNORECASE,
+    )
+
+    def extract_referencias_split(
+        self, text: str
+    ) -> tuple[list[str], list[str], list[str], str | None]:
+        """
+        E4 (v5): Separa referencias en 3 categorías + identifica normativa principal.
+        Retorna: (referencias_normativas, articulos_mencionados,
+                   referencias_documentales, normativa_principal)
+        """
+        normativas: list[str] = []
+        articulos: list[str] = []
+        documentales: list[str] = []
         seen: set[str] = set()
-        refs: list[str] = []
+
         for m in self._RE_NORM.finditer(text):
             val = " ".join(m.group(0).split())
-            if val not in seen and len(val) > 5:
-                seen.add(val)
-                refs.append(val)
-        return refs
+            if val in seen or len(val) <= 5:
+                continue
+            seen.add(val)
+            if self._RE_REF_ART.match(val):
+                articulos.append(val)
+            elif self._RE_REF_DOC.match(val):
+                documentales.append(val)
+            else:
+                normativas.append(val)
+
+        # normativa_principal = primera ley/código de jerarquía superior
+        normativa_principal: str | None = None
+        for ref in normativas:
+            if self._RE_REF_LEY_PRINCIPAL.match(ref):
+                normativa_principal = ref
+                break
+
+        return normativas, articulos, documentales, normativa_principal
+
+    # Fechas en el cuerpo (formato largo o numérico)
+    _RE_FECHAS_CUERPO = re.compile(
+        r"\b(\d{1,2}\s+de\s+(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|"
+        r"septiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?\d{4})\b"
+        r"|\b(\d{1,2}/\d{1,2}/\d{4})\b"
+        r"|\b(\d{4}-\d{2}-\d{2})\b",
+        re.IGNORECASE,
+    )
+
+    def extract_todas_fechas(self, text: str, cap: int = 20) -> list[str]:
+        """E3-bis (v5): todas las fechas relevantes del documento como ISO strings."""
+        seen: set[str] = set()
+        result: list[str] = []
+        for m in self._RE_FECHAS_CUERPO.finditer(text):
+            raw = next((g for g in m.groups() if g), None)
+            if not raw:
+                continue
+            try:
+                parsed = dateparser.parse(
+                    raw, languages=["es"],
+                    settings={
+                        "PREFER_DAY_OF_MONTH": "first",
+                        "RETURN_AS_TIMEZONE_AWARE": False,
+                    },
+                )
+                iso = parsed.date().isoformat() if parsed else raw
+            except Exception:
+                iso = raw
+            if iso not in seen:
+                seen.add(iso)
+                result.append(iso)
+            if len(result) >= cap:
+                break
+        return result
 
     def extract_estado(self, text: str) -> str | None:
         """E5: Estado Quipux por fuzzy matching."""
@@ -782,8 +993,7 @@ class EntityExtractor:
         # Busca en todo el texto (no solo cabecera) pares tratamiento+nombre
         # que el StructuralParser pudo haber omitido (p.ej. delegados en cuerpo)
         for m in StructuralParser.RE_NOMBRE_TRAT.finditer(text):
-            candidato = m.group(0).strip()
-            # Evitar fragmentos de cargos etiquetados erróneamente
+            candidato = " ".join(m.group(0).split())  # normaliza saltos de línea
             if len(candidato) >= _CONFIG.MIN_PERSONA_LEN:
                 personas.add(candidato)
 
@@ -795,10 +1005,12 @@ class EntityExtractor:
                 cargos.add(ent.text.strip())
             elif ent.label_ == "LUGAR_EC":
                 lugares.add(ent.text.strip())
-            # spaCy PER nativo — solo si supera longitud mínima
+            # spaCy PER nativo — normalizar whitespace, requerir 2+ palabras, filtrar ruido
             elif ent.label_ == "PER" and len(ent.text) >= _CONFIG.MIN_PERSONA_LEN:
-                if not ent.text.isupper():
-                    personas.add(ent.text.strip())
+                clean = " ".join(ent.text.split())
+                if (not clean.isupper() and " " in clean
+                        and not _CONFIG.SPACY_PER_NOISE.search(clean)):
+                    personas.add(clean)
 
         # — Capa 3: BETO sobre cabecera ampliada (≤800 chars) —
         if self.beto:
@@ -861,24 +1073,245 @@ class EntityExtractor:
         # spaCy sobre los primeros 100k chars para no saturar memoria
         doc = self.nlp(text[:100_000])
 
-        personas, orgs, cargos, lugares = self.extract_from_structure(parsed, text, doc)
-        accion, accion_clase = self.extract_accion(doc)
+        personas, orgs, cargos, _ = self.extract_from_structure(parsed, text, doc)
+        accion, _ = self.extract_accion(doc)
         anexos = self.extract_anexos(text, doc)
+        normativas, articulos, documentales, normativa_principal = \
+            self.extract_referencias_split(text)
+        fechas = self.extract_todas_fechas(text)
 
         return QuipuxMetadata(
-            tipo_documento=tipo,
-            codigo_documental=self.extract_codigo(text),
-            fecha_iso=self.extract_fecha(text),
-            lugar=lugares,
-            personas=personas,
-            organizaciones=orgs,
-            cargos=cargos,
-            referencias_normativas=self.extract_referencias(text),
-            estado=self.extract_estado(text),
-            accion_requerida=accion,
-            accion_clase=accion_clase,
-            anexos=anexos,
+            METADATOS=MetadatosBlock(
+                tipo_documento=tipo,
+                numero_documento=self.extract_codigo(text),
+                fecha_documento=self.extract_fecha(text),
+                asunto=parsed.get("asunto"),
+                institucion_emisora=parsed.get("institucion_emisora"),
+                institucion_destino=parsed.get("institucion_destino"),
+                firmante=parsed.get("firmante"),
+                cargo_firmante=parsed.get("firmante_cargo"),
+            ),
+            CONTENIDO_FUNCIONAL=ContenidoFuncionalBlock(
+                accion_principal=accion,
+                documentos_mencionados=[a["etiqueta"] for a in anexos],
+                # solicitudes/acciones_requeridas/problemas_juridicos/hechos_relevantes
+                # los llena SemanticExtractor en QuipuxPipeline si está habilitado
+            ),
+            NORMATIVA=NormativaBlock(
+                normativa_principal=normativa_principal,
+                referencias_normativas=normativas,
+                articulos_mencionados=articulos,
+            ),
+            ENTIDADES=EntidadesBlock(
+                personas=personas,
+                instituciones=orgs,
+                cargos=cargos,
+                fechas_relevantes=fechas,
+                referencias_documentales=documentales,
+            ),
         )
+
+
+# ===========================================================================
+# SECCIÓN 6b — SemanticExtractor (LLM API para campos semánticos)
+# ===========================================================================
+
+class SemanticExtractor:
+    """
+    Extrae campos semánticos vía LLM API: objeto_tramite, solicitudes,
+    acciones_requeridas, problemas_juridicos, hechos_relevantes.
+
+    Activado con QUIPUX_LOAD_LLM=true. Soporta OpenAI directo, Azure OpenAI
+    y Anthropic Claude. Si falta la API key o falla la llamada, retorna
+    valores vacíos sin propagar excepción.
+    """
+
+    _PROMPT_SISTEMA = (
+        "Eres un asistente jurídico especializado en documentos administrativos "
+        "del sistema Quipux del Ecuador (memorandos, oficios, resoluciones). "
+        "Extraes información estructurada en JSON estricto aplicando las reglas "
+        "de formato indicadas. No añades texto fuera del JSON."
+    )
+
+    _PROMPT_USUARIO = """Del siguiente documento administrativo ecuatoriano extrae esta estructura JSON exacta:
+
+{{
+  "accion_principal": "<verbo en infinitivo + objeto/contexto breve>",
+  "objeto_tramite": "<sintagma nominal breve centrado en un sustantivo>",
+  "solicitudes": ["<solicitud explícita 1>"],
+  "acciones_requeridas": ["<acción en infinitivo 1>"],
+  "problemas_juridicos": ["<cuestión jurídica 1>"],
+  "hechos_relevantes": ["<antecedente o hecho relevante 1>"]
+}}
+
+=== REGLAS ESTRICTAS POR CAMPO ===
+
+CAMPO: accion_principal
+  Definicion: Intención documental u operativa del EMISOR del documento (no del consultante ni destinatario).
+  Formato obligatorio: Verbo en INFINITIVO + objeto/contexto breve.
+  PROHIBIDO: verbos conjugados sueltos (asumen un estado o decision ya tomada).
+
+  INCORRECTO         -> CORRECTO
+  "autoriza"         -> "Autorizar la compra de equipos"
+  "solicita"         -> "Solicitar aprobación de informe"
+  "remite"           -> "Remitir expediente al departamento jurídico"
+  "aprueba"          -> "Aprobar modificación presupuestaria"
+  "emite"            -> "Emitir criterio jurídico sobre viabilidad"
+  "informa"          -> "Informar sobre estado del proceso de contratación"
+  "absuelve consulta sobre X" -> "Absolver consulta sobre X"
+
+CAMPO: objeto_tramite
+  Definicion: Tema central o asunto del documento.
+  Formato obligatorio: Sintagma nominal (frase corta centrada en un sustantivo).
+  PROHIBIDO: lenguaje narrativo, descriptivo extenso o frases introductorias
+             del tipo "El documento trata de...", "Es una respuesta a...",
+             "Trata sobre...", "Se refiere a...".
+
+  INCORRECTO
+    "El documento es una respuesta al memorando que solicita un pronunciamiento jurídico."
+  CORRECTO
+    "Pronunciamiento jurídico sobre designación de Auditor Interno Bancario"
+
+  INCORRECTO
+    "Trata sobre la terminación del contrato del servidor público."
+  CORRECTO
+    "Terminación de contrato de servidor público"
+
+  INCORRECTO
+    "Es un oficio informativo sobre el estado del proceso de contratación."
+  CORRECTO
+    "Informe de estado de proceso de contratación"
+
+CAMPO: solicitudes
+  Acciones explícitas que el emisor solicita al destinatario.
+
+CAMPO: acciones_requeridas
+  Pasos concretos en infinitivo que el destinatario debe ejecutar.
+
+CAMPO: problemas_juridicos
+  Controversias, cuestiones de derecho o inconsistencias normativas planteadas.
+
+CAMPO: hechos_relevantes
+  Antecedentes o circunstancias factuales mencionadas en el documento.
+
+=== REGLAS GLOBALES ===
+- Responde UNICAMENTE con el JSON. Sin markdown, sin texto adicional.
+- Si un campo de lista no aplica usa [].
+- Si accion_principal u objeto_tramite no son identificables usa null.
+- Cada cadena: máximo 2 oraciones concisas.
+
+TEXTO DEL DOCUMENTO:
+---
+{texto}
+---"""
+
+    _FALLBACK = {
+        "accion_principal": None,
+        "objeto_tramite": None,
+        "solicitudes": [],
+        "acciones_requeridas": [],
+        "problemas_juridicos": [],
+        "hechos_relevantes": [],
+    }
+
+    def __init__(self, provider: str = "openai", use_azure: bool = False):
+        self.provider = provider
+        self.use_azure = use_azure
+        self.client = None
+        self._model = None
+        self._init_client()
+
+    def _init_client(self):
+        if self.provider == "openai":
+            try:
+                import openai
+            except ImportError:
+                log.error(
+                    "openai no instalado. Agregar 'openai' a requirements.txt "
+                    "o desactivar QUIPUX_LOAD_LLM."
+                )
+                return
+            try:
+                if self.use_azure:
+                    self.client = openai.AzureOpenAI(
+                        api_key=os.environ.get("AZURE_OPENAI_KEY"),
+                        api_version=os.environ.get(
+                            "AZURE_OPENAI_API_VERSION", "2024-02-01"
+                        ),
+                        azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+                    )
+                    self._model = os.environ.get("QUIPUX_LLM_MODEL", "gpt-4o-mini")
+                    log.info("SemanticExtractor: AzureOpenAI listo (deployment=%s)",
+                             self._model)
+                else:
+                    self.client = openai.OpenAI(
+                        api_key=os.environ.get("OPENAI_API_KEY"),
+                    )
+                    self._model = os.environ.get("QUIPUX_LLM_MODEL", "gpt-4o-mini")
+                    log.info("SemanticExtractor: OpenAI listo (model=%s)", self._model)
+            except Exception as e:
+                log.error("SemanticExtractor: error inicializando cliente OpenAI: %s", e)
+                self.client = None
+
+        elif self.provider == "anthropic":
+            try:
+                import anthropic
+            except ImportError:
+                log.error(
+                    "anthropic no instalado. Agregar 'anthropic' a requirements.txt "
+                    "o cambiar QUIPUX_LLM_PROVIDER a openai."
+                )
+                return
+            try:
+                self.client = anthropic.Anthropic(
+                    api_key=os.environ.get("ANTHROPIC_API_KEY")
+                )
+                self._model = os.environ.get("QUIPUX_LLM_MODEL", "claude-haiku-4-5")
+                log.info("SemanticExtractor: Anthropic listo (model=%s)", self._model)
+            except Exception as e:
+                log.error("SemanticExtractor: error inicializando cliente Anthropic: %s", e)
+                self.client = None
+        else:
+            log.error("SemanticExtractor: provider desconocido '%s'", self.provider)
+
+    def extract(self, text: str, max_chars: int = 6000) -> dict:
+        """Llama al LLM y retorna dict con los 5 campos semánticos."""
+        if self.client is None:
+            return dict(self._FALLBACK)
+
+        texto_truncado = text[:max_chars]
+        prompt = self._PROMPT_USUARIO.format(texto=texto_truncado)
+
+        try:
+            if self.provider == "openai":
+                resp = self.client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {"role": "system", "content": self._PROMPT_SISTEMA},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                    max_tokens=800,
+                )
+                raw = resp.choices[0].message.content
+            elif self.provider == "anthropic":
+                resp = self.client.messages.create(
+                    model=self._model,
+                    max_tokens=800,
+                    system=self._PROMPT_SISTEMA,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = resp.content[0].text
+            else:
+                return dict(self._FALLBACK)
+
+            data = json.loads(raw)
+            return {k: data.get(k, self._FALLBACK[k]) for k in self._FALLBACK}
+
+        except Exception as e:
+            log.warning("SemanticExtractor: llamada al LLM falló: %s", e)
+            return dict(self._FALLBACK)
 
 
 # ===========================================================================
@@ -903,13 +1336,32 @@ class QuipuxPipeline:
     Singleton implícito: instanciar una vez y reutilizar para lotes.
     """
 
-    def __init__(self, device: str = "cpu", load_beto: bool = True):
+    def __init__(
+        self,
+        device: str = "cpu",
+        load_beto: bool = True,
+        load_llm: bool | None = None,
+    ):
         self.pdf = PDFProcessor()
         self.clf = DocumentClassifier()
         self.sp = StructuralParser()
         self.fp = FallbackParser()
         self.extractor = EntityExtractor(device=device, load_beto=load_beto)
         self.encoder = MetadataEncoder()
+
+        # SemanticExtractor opcional (LLM API)
+        if load_llm is None:
+            load_llm = os.getenv("QUIPUX_LOAD_LLM", "false").lower() == "true"
+        self.semantic: SemanticExtractor | None = None
+        if load_llm:
+            provider = os.getenv("QUIPUX_LLM_PROVIDER", "openai")
+            use_azure = os.getenv("QUIPUX_LLM_USE_AZURE", "false").lower() == "true"
+            try:
+                self.semantic = SemanticExtractor(
+                    provider=provider, use_azure=use_azure,
+                )
+            except Exception as e:
+                log.warning("SemanticExtractor no disponible: %s", e)
 
     def process(self, pdf_path: Path) -> QuipuxDocument:
         text = self.pdf.extract_text(pdf_path)
@@ -927,6 +1379,16 @@ class QuipuxPipeline:
         metadata = self.extractor.extract_all(text, tipo, parsed)
         metadata.procesable = procesable
         metadata.motivo_rechazo = motivo
+
+        # Enriquecimiento semántico vía LLM (solo si está habilitado y procesable)
+        if self.semantic is not None and procesable:
+            sem = self.semantic.extract(text)
+            metadata.CONTENIDO_FUNCIONAL.accion_principal = sem["accion_principal"]
+            metadata.CONTENIDO_FUNCIONAL.objeto_tramite = sem["objeto_tramite"]
+            metadata.CONTENIDO_FUNCIONAL.solicitudes = sem["solicitudes"]
+            metadata.CONTENIDO_FUNCIONAL.acciones_requeridas = sem["acciones_requeridas"]
+            metadata.CONTENIDO_FUNCIONAL.problemas_juridicos = sem["problemas_juridicos"]
+            metadata.CONTENIDO_FUNCIONAL.hechos_relevantes = sem["hechos_relevantes"]
 
         return QuipuxDocument(fuente=str(pdf_path), metadata=metadata)
 
@@ -947,18 +1409,27 @@ class QuipuxPipeline:
 # ===========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Quipux NER Extractor v4")
+    parser = argparse.ArgumentParser(description="Quipux NER Extractor v5")
     parser.add_argument("pdf", type=Path)
     parser.add_argument("--output", "-o", type=Path, default=None)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--no-beto", action="store_true")
+    parser.add_argument(
+        "--llm", action="store_true",
+        help="Activa SemanticExtractor (requiere OPENAI_API_KEY o equivalente)",
+    )
     args = parser.parse_args()
 
     if not args.pdf.exists():
         log.error("No encontrado: %s", args.pdf)
         sys.exit(1)
 
-    pipeline = QuipuxPipeline(device=args.device, load_beto=not args.no_beto)
+    load_llm = True if args.llm else None  # None → respeta env var
+    pipeline = QuipuxPipeline(
+        device=args.device,
+        load_beto=not args.no_beto,
+        load_llm=load_llm,
+    )
     doc = pipeline.process_and_save(args.pdf, args.output)
     print(doc.to_json())
 

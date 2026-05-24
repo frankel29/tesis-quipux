@@ -1,7 +1,9 @@
 """
-quipux_api — main.py  (compatible con quipux_extractor.py v4)
+quipux_api — main.py  (compatible con quipux_extractor.py v5)
 ====================
 API REST para el extractor NER de documentos Quipux/SERCOP.
+Devuelve JSON con schema de 4 bloques: METADATOS, CONTENIDO_FUNCIONAL,
+NORMATIVA, ENTIDADES.
 
 Endpoints
 ---------
@@ -16,10 +18,18 @@ Uso local
 
 Variables de entorno
 --------------------
-  QUIPUX_DEVICE       cpu | cuda          (default: cpu)
-  QUIPUX_LOAD_BETO    true | false        (default: true)
-  QUIPUX_MAX_FILE_MB  tamaño máximo PDF   (default: 20)
-  API_KEY             clave Bearer        (default: desactivado)
+  QUIPUX_DEVICE         cpu | cuda          (default: cpu)
+  QUIPUX_LOAD_BETO      true | false        (default: true)
+  QUIPUX_MAX_FILE_MB    tamaño máximo PDF   (default: 20)
+  API_KEY               clave Bearer        (default: desactivado)
+  QUIPUX_LOAD_LLM       true | false        (default: false)
+  QUIPUX_LLM_PROVIDER   openai | anthropic  (default: openai)
+  QUIPUX_LLM_MODEL      modelo o deployment (default: gpt-4o-mini)
+  QUIPUX_LLM_USE_AZURE  true | false        (default: false)
+  OPENAI_API_KEY        API key OpenAI directa
+  AZURE_OPENAI_ENDPOINT endpoint Azure OpenAI
+  AZURE_OPENAI_KEY      API key Azure OpenAI
+  ANTHROPIC_API_KEY     API key Anthropic
 """
 
 from __future__ import annotations
@@ -60,6 +70,8 @@ logging.basicConfig(
 
 DEVICE       = os.getenv("QUIPUX_DEVICE", "cpu")
 LOAD_BETO    = os.getenv("QUIPUX_LOAD_BETO", "true").lower() == "true"
+LOAD_LLM     = os.getenv("QUIPUX_LOAD_LLM", "false").lower() == "true"
+LLM_PROVIDER = os.getenv("QUIPUX_LLM_PROVIDER", "openai")
 MAX_FILE_MB  = int(os.getenv("QUIPUX_MAX_FILE_MB", "20"))
 API_KEY      = os.getenv("API_KEY", "")
 MAX_BATCH    = 10
@@ -82,9 +94,14 @@ app_state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Iniciando QuipuxPipeline (device=%s, beto=%s)…", DEVICE, LOAD_BETO)
+    log.info(
+        "Iniciando QuipuxPipeline (device=%s, beto=%s, llm=%s, provider=%s)…",
+        DEVICE, LOAD_BETO, LOAD_LLM, LLM_PROVIDER if LOAD_LLM else "—",
+    )
     t0 = time.time()
-    app_state.pipeline = QuipuxPipeline(device=DEVICE, load_beto=LOAD_BETO)
+    app_state.pipeline = QuipuxPipeline(
+        device=DEVICE, load_beto=LOAD_BETO, load_llm=LOAD_LLM,
+    )
     app_state.started_at = time.time()
     app_state.models_ready = True
     log.info("Pipeline listo en %.1f s", time.time() - t0)
@@ -98,8 +115,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Quipux NER API",
-    description="Extracción de entidades nombradas en documentos PDF Quipux/SERCOP.",
-    version="4.0.0",
+    description=(
+        "Extracción de entidades nombradas en documentos PDF Quipux/SERCOP. "
+        "Schema de salida v6: METADATOS, CONTENIDO_FUNCIONAL, NORMATIVA, ENTIDADES."
+    ),
+    version="6.0.0",
     lifespan=lifespan,
 )
 
@@ -120,6 +140,8 @@ class HealthResponse(BaseModel):
     models_ready: bool
     device: str
     beto_enabled: bool
+    llm_enabled: bool
+    llm_provider: str | None
     uptime_seconds: float
 
 
@@ -213,6 +235,8 @@ def health():
         models_ready=app_state.models_ready,
         device=DEVICE,
         beto_enabled=LOAD_BETO,
+        llm_enabled=LOAD_LLM,
+        llm_provider=LLM_PROVIDER if LOAD_LLM else None,
         uptime_seconds=round(uptime, 1),
     )
 
@@ -242,12 +266,13 @@ async def extraer(
     try:
         resultado, elapsed_ms = _process_bytes(content, file.filename, pipeline)
 
+        meta = resultado.get("metadata", {})
         log.info(
             "[%s] OK en %.0f ms | tipo=%s procesable=%s",
             request_id,
             elapsed_ms,
-            resultado.get("metadata", {}).get("tipo_documento"),
-            resultado.get("metadata", {}).get("procesable"),
+            meta.get("METADATOS", {}).get("tipo_documento"),
+            meta.get("procesable"),
         )
 
         return ExtractionResponse(
