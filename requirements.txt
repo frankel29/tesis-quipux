@@ -1,5 +1,5 @@
 # ============================================================
-# requirements.txt — Quipux NER API
+# requirements.txt — Quipux NER API v5
 # Tesis: Generación de borradores RAG para sistema Quipux
 # ============================================================
 
@@ -20,8 +20,11 @@ transformers==4.44.2
 torch==2.4.1
 tokenizers==0.19.1
 
-# --- Embeddings semánticos ---
-sentence-transformers==3.1.1
+# --- LLM semántico (activado con QUIPUX_LOAD_LLM=true) ---
+# Compatible con OpenAI directo y Azure OpenAI Service
+# 1.55.3 evita el bug de httpx>=0.28 ("unexpected keyword argument 'proxies'")
+openai==1.55.3
+# anthropic==0.29.0   # descomentar si se prefiere Claude
 
 # --- Fuzzy matching ---
 rapidfuzz==3.9.7
