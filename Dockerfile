@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TRANSFORMERS_CACHE=/app/.cache/huggingface \
     QUIPUX_LOAD_LLM=false \
     QUIPUX_LLM_PROVIDER=openai \
-    QUIPUX_LLM_MODEL=gpt-4o-mini \
+    QUIPUX_LLM_MODEL=gpt-4o \
     QUIPUX_LLM_USE_AZURE=false
 
 WORKDIR /app

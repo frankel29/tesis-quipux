@@ -1,9 +1,9 @@
 """
-quipux_extractor.py  —  v6
-==========================
+quipux_extractor.py  —  v6.1
+============================
 Extractor NER para documentos Quipux (PDF → JSON enriquecido).
 
-Schema de salida v5 (4 bloques estructurados para RAG):
+Schema de salida v6.1 (4 bloques estructurados para RAG):
   METADATOS:           tipo_documento, numero_documento, fecha_documento, asunto,
                        institucion_emisora, institucion_destino,
                        firmante, cargo_firmante
@@ -11,9 +11,20 @@ Schema de salida v5 (4 bloques estructurados para RAG):
                        acciones_requeridas, problemas_juridicos,
                        hechos_relevantes, documentos_mencionados
   NORMATIVA:           normativa_principal, referencias_normativas,
-                       articulos_mencionados
+                       articulos_mencionados, fundamentos_juridicos
   ENTIDADES:           personas, instituciones, cargos, fechas_relevantes,
                        referencias_documentales
+
+Cambios v6.1 respecto a v6
+---------------------------
+  - NormativaBlock: nuevo campo fundamentos_juridicos[FundamentoJuridico]
+                    con (cita, articulo, norma, sigla, tema) para indexación
+                    en RAG por par artículo+documento (ej. "Art. 71 LOSNCP").
+  - _Catalogs.SIGLAS_NORMAS: catálogo sigla→nombre de leyes/códigos EC.
+  - EntityExtractor.extract_fundamentos_juridicos: regex compacto
+                    "Art. N SIGLA" sobre ASUNTO + cuerpo.
+  - SemanticExtractor: LLM enriquece fundamentos con `tema` y selecciona
+                       los centrales; valida tipos y deduplica.
 
 Cambios v5 respecto a v4
 -------------------------
@@ -49,7 +60,7 @@ Variables de entorno LLM
 -------------------------
   QUIPUX_LOAD_LLM        true|false (default false)
   QUIPUX_LLM_PROVIDER    openai|anthropic (default openai)
-  QUIPUX_LLM_MODEL       nombre de modelo o deployment Azure (default gpt-4o-mini)
+  QUIPUX_LLM_MODEL       nombre de modelo o deployment Azure (default gpt-4o)
   QUIPUX_LLM_USE_AZURE   true|false — usar AzureOpenAI (default false)
   OPENAI_API_KEY         API key directa OpenAI
   AZURE_OPENAI_ENDPOINT  endpoint Azure
@@ -73,6 +84,7 @@ import re
 import sys
 import argparse
 import logging
+import unicodedata
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -161,10 +173,28 @@ class ContenidoFuncionalBlock:
 
 
 @dataclass
+class FundamentoJuridico:
+    """
+    Vínculo artículo + norma para indexación en RAG.
+
+    Campo `cita` es la forma compacta lista para vectorizar
+    ("Art. 71 LOSNCP"). El resto son metadatos para filtros y
+    explicación humana.
+    """
+    cita: str                       # "Art. 71 LOSNCP"
+    articulo: str                   # "Art. 71"
+    norma: str | None = None        # "Ley Orgánica del Sistema Nacional de Contratación Pública"
+    sigla: str | None = None        # "LOSNCP"
+    tema: str | None = None         # "Cálculo de multas contractuales"
+    prioridad: str | None = None    # "ALTA" | "MEDIA" | "BAJA" — relevancia jurídica frente al problema central; null si solo lo halló el regex
+
+
+@dataclass
 class NormativaBlock:
     normativa_principal: str | None = None
     referencias_normativas: list[str] = field(default_factory=list)
     articulos_mencionados: list[str] = field(default_factory=list)
+    fundamentos_juridicos: list[FundamentoJuridico] = field(default_factory=list)
 
 
 @dataclass
@@ -513,10 +543,17 @@ class StructuralParser:
         if m:
             raw = " ".join(m.group(1).split())
             # Cortar en el primer indicio del bloque PARA (destinatario)
-            # o en un punto que cierre oración seguido de mayúscula
+            # o en un punto que cierre oración seguido de mayúscula.
+            # Los lookbehinds excluyen cadenas de abreviaturas (FF.AA., D.M.,
+            # EE.UU., U.S.A.) que tienen mayúsculas antes del punto pero NO
+            # son fin de oración.
             cut = re.search(
-                r'\.\s+(?=[A-ZÁÉÍÓÚÑ][a-záéíóúñ])'               # punto + mayúscula
-                r'|[\)\.]\s+(?=Señor[a]?\s+(?:\w+\.?\s+)?[A-ZÁÉÍÓÚÑ])', # ) o . antes de Señor/Señora
+                # Punto + minúscula = fin de oración real.
+                # NO cortar si el punto sigue a una mayúscula: descarta
+                # cadenas de abreviaturas (FF.AA., D.M., EE.UU.) y acrónimos
+                # de leyes (LOSNCP., RGLOSNCP., LOSEP., COA.).
+                r'(?<![A-ZÁÉÍÓÚÑ])\.\s+(?=[A-ZÁÉÍÓÚÑ][a-záéíóúñ])'
+                r'|[\)\.]\s+(?=Señor[a]?\s+(?:\w+\.?\s+)?[A-ZÁÉÍÓÚÑ])',
                 raw
             )
             if cut and cut.start() > 10:
@@ -693,6 +730,96 @@ class _Catalogs:
         "en proceso", "resuelto", "derivado", "anulado", "recibido", "leído",
     ]
 
+    # Siglas oficiales de instituciones ecuatorianas → nombre completo
+    # Usado para inferir institucion_emisora desde el numero_documento
+    # cuando el parser estructural no la encontró (ej.: memos internos
+    # sin bloque DE explícito).
+    SIGLAS_INSTITUCIONES = {
+        "SERCOP":      "Servicio Nacional de Contratación Pública",
+        "SRI":         "Servicio de Rentas Internas",
+        "IESS":        "Instituto Ecuatoriano de Seguridad Social",
+        "BCE":         "Banco Central del Ecuador",
+        "CGE":         "Contraloría General del Estado",
+        "PGE":         "Procuraduría General del Estado",
+        "CNE":         "Consejo Nacional Electoral",
+        "SENESCYT":    "Secretaría de Educación Superior, Ciencia, Tecnología e Innovación",
+        "SENAGUA":     "Secretaría Nacional del Agua",
+        "MAATE":       "Ministerio de Ambiente, Agua y Transición Ecológica",
+        "MIES":        "Ministerio de Inclusión Económica y Social",
+        "MINEDUC":     "Ministerio de Educación",
+        "MSP":         "Ministerio de Salud Pública",
+        "MDT":         "Ministerio del Trabajo",
+        "MEF":         "Ministerio de Economía y Finanzas",
+        "SBS":         "Superintendencia de Bancos",
+        "SCVS":        "Superintendencia de Compañías, Valores y Seguros",
+        "SUPERCIAS":   "Superintendencia de Compañías, Valores y Seguros",
+        "MEER":        "Ministerio de Energía y Recursos Naturales No Renovables",
+        "MREMH":       "Ministerio de Relaciones Exteriores y Movilidad Humana",
+        "DINARP":      "Dirección Nacional de Registros Públicos",
+        "MTOP":        "Ministerio de Transporte y Obras Públicas",
+        "MIDUVI":      "Ministerio de Desarrollo Urbano y Vivienda",
+        "MIPRO":       "Ministerio de Producción, Comercio Exterior, Inversiones y Pesca",
+        "MAG":         "Ministerio de Agricultura y Ganadería",
+        "MINTUR":      "Ministerio de Turismo",
+        "MINDEF":      "Ministerio de Defensa Nacional",
+        "MINTEL":      "Ministerio de Telecomunicaciones y de la Sociedad de la Información",
+        "SENAE":       "Servicio Nacional de Aduana del Ecuador",
+        "ARCSA":       "Agencia Nacional de Regulación, Control y Vigilancia Sanitaria",
+        "ANT":         "Agencia Nacional de Tránsito",
+        "INEC":        "Instituto Nacional de Estadística y Censos",
+        "CFN":         "Corporación Financiera Nacional",
+        "CNT":         "Corporación Nacional de Telecomunicaciones",
+        "ECU911":      "Servicio Integrado de Seguridad ECU 911",
+        "CCFFAA":      "Comando Conjunto de las Fuerzas Armadas",
+    }
+
+    # Siglas oficiales de normativa ecuatoriana → nombre completo
+    # Usado para construir FundamentoJuridico (cita, sigla, norma)
+    SIGLAS_NORMAS = {
+        # Constitución
+        "CRE":     "Constitución de la República del Ecuador",
+        "CPRE":    "Constitución de la República del Ecuador",
+        # Códigos orgánicos
+        "COA":     "Código Orgánico Administrativo",
+        "COIP":    "Código Orgánico Integral Penal",
+        "COGEP":   "Código Orgánico General de Procesos",
+        "COFJ":    "Código Orgánico de la Función Judicial",
+        "COOTAD":  "Código Orgánico de Organización Territorial, Autonomía y Descentralización",
+        "COPLAFIP": "Código Orgánico de Planificación y Finanzas Públicas",
+        "COPYFP":  "Código Orgánico de Planificación y Finanzas Públicas",
+        "COESCCI": "Código Orgánico de la Economía Social de los Conocimientos, Creatividad e Innovación",
+        "COMYF":   "Código Orgánico Monetario y Financiero",
+        # Códigos
+        "CC":      "Código Civil",
+        "CT":      "Código del Trabajo",
+        "CTRIB":   "Código Tributario",
+        # Leyes orgánicas
+        "LOSNCP":  "Ley Orgánica del Sistema Nacional de Contratación Pública",
+        "LOSEP":   "Ley Orgánica del Servicio Público",
+        "LOES":    "Ley Orgánica de Educación Superior",
+        "LOEI":    "Ley Orgánica de Educación Intercultural",
+        "LOGJCC":  "Ley Orgánica de Garantías Jurisdiccionales y Control Constitucional",
+        "LOTAIP":  "Ley Orgánica de Transparencia y Acceso a la Información Pública",
+        "LOEPS":   "Ley Orgánica de la Economía Popular y Solidaria",
+        "LOPC":    "Ley Orgánica de Participación Ciudadana",
+        "LOMH":    "Ley Orgánica de Movilidad Humana",
+        "LORTI":   "Ley Orgánica de Régimen Tributario Interno",
+        "LOC":     "Ley Orgánica de Comunicación",
+        "LOSCCA":  "Ley Orgánica del Consejo de Participación Ciudadana y Control Social",
+        "LORHUyA": "Ley Orgánica de Recursos Hídricos, Usos y Aprovechamiento del Agua",
+        "LOSNS":   "Ley Orgánica del Sistema Nacional de Salud",
+        "LODP":    "Ley Orgánica de Datos Personales",
+        # Reglamentos generales (con frecuencia citados como RGLO… o RLO…)
+        "RGLOSNCP": "Reglamento General a la Ley Orgánica del Sistema Nacional de Contratación Pública",
+        "RLOSNCP":  "Reglamento General a la Ley Orgánica del Sistema Nacional de Contratación Pública",
+        "RGLOSEP":  "Reglamento General a la Ley Orgánica del Servicio Público",
+        "RLOSEP":   "Reglamento General a la Ley Orgánica del Servicio Público",
+        # Leyes ordinarias frecuentes
+        "LC":      "Ley de Compañías",
+        "LDC":     "Ley Orgánica de Defensa del Consumidor",
+        "LODC":    "Ley Orgánica de Defensa del Consumidor",
+    }
+
 
 # ===========================================================================
 # SECCIÓN 6 — EntityExtractor
@@ -832,14 +959,14 @@ class EntityExtractor:
     _RE_NORM = re.compile(
         r"(?:"
         r"[Aa]rt(?:ículo)?\.?\s*\d+(?:\.\d+)*(?:\s+(?:literal|numeral|inciso)\s+\w+)?"
-        r"|Resolución\s+(?:Nro?\.N°\.?|No\.?)\s*[\w\-]+"
-        r"|Acuerdo\s+Ministerial\s+(?:Nro?\.N°\.?)?\s*[\w\-]+"
+        r"|Resolución\s+(?:Nro?\.N°\.?|No\.?)\s*[\w\-]*\d[\w\-]*"
+        r"|Acuerdo\s+Ministerial\s+(?:Nro?\.N°\.?)?\s*[\w\-]*\d[\w\-]*"
         r"|Decreto\s+Ejecutivo\s+(?:No\.?|Nro?\.)?\s*\d+"
         r"|Ley\s+Orgánica\s+[\w\s]{5,60}?(?=\s*[-,;\n])"
         r"|Código\s+Orgánico\s+[\w\s]{3,50}?(?=\s*[-,;\n])"
         r"|Código\s+del\s+Trabajo"
-        r"|Oficio\s+(?:Nro?\.N°\.?|No\.?)\s*[\w\-]+"
-        r"|Memorando\s+(?:Nro?\.N°\.?|No\.?)\s*[\w\-]+"
+        r"|Oficio\s+(?:Nro?\.N°\.?|No\.?)\s*[\w\-]*\d[\w\-]*"
+        r"|Memorando\s+(?:Nro?\.N°\.?|No\.?)\s*[\w\-]*\d[\w\-]*"
         r"|Reglamento\s+General\s+[\w\s]{3,50}?(?=\s*[-,;\n])"
         r"|Reglamento\s+a\s+la\s+Ley\s+[\w\s]{3,50}?(?=\s*[-,;\n])"
         r")",
@@ -858,6 +985,83 @@ class EntityExtractor:
         re.IGNORECASE,
     )
 
+    # ----- Fundamentos jurídicos (Art. N + sigla de norma) -----
+    # Pre-ordenado por longitud descendente para evitar prefix-matches:
+    # "RGLOSNCP" debe intentar match antes que "LOSNCP".
+    _SIGLAS_PATTERN = "|".join(
+        sorted(_Catalogs.SIGLAS_NORMAS.keys(), key=len, reverse=True)
+    )
+    # Captura con prefijo "art/artículo(s)" + conector OPCIONAL.
+    # Soporta plural y listas con sigla compartida:
+    #   "Art. 71 LOSNCP", "art 71 de la LOSNCP", "artículo 7 LOSEP",
+    #   "artículos 70 y 80 de la LOSNCP", "arts. 92, 93 y 94 LOSNCP"
+    # group(1) = run de números ("70 y 80"); group(2) = sigla.
+    _RE_ART_SIGLA = re.compile(
+        rf"\b[Aa]rt(?:s|[ií]culos?)?\.?\s*"
+        rf"(\d+(?:\.\d+)*(?:\s*(?:,|y|e)\s*\d+(?:\.\d+)*)*)"
+        rf"(?:\s+(?:numeral|literal|inciso)\s+\w+)?"
+        rf"\s+(?:de\s+(?:la\s+|los?\s+|el\s+)?|del\s+)?"
+        rf"({_SIGLAS_PATTERN})\b",
+        re.IGNORECASE,
+    )
+    # Continuación de lista SIN prefijo "art", conector OBLIGATORIO.
+    # Rescata el segundo tramo de "…LOSNCP y 121 del RGLOSNCP".
+    # El lookbehind exige que el número sea continuación de enumeración
+    # (precedido por "y "/", "/"e ") + conector "de la"/"del" obligatorio.
+    # Esto evita falsos positivos con años ("2020 de la LOSNCP") y
+    # numerales ("numeral 4 del RGLOSNCP").
+    # group(1) = run de números; group(2) = sigla.
+    _RE_NUM_SIGLA = re.compile(
+        rf"(?<=[,ye]\s)\b(\d+(?:\.\d+)*(?:\s*(?:,|y|e)\s*\d+(?:\.\d+)*)*)"
+        rf"\s+(?:de\s+(?:la\s+|los?\s+|el\s+)|del\s+)"
+        rf"({_SIGLAS_PATTERN})\b",
+        re.IGNORECASE,
+    )
+    # Separa un run ("70 y 80", "92, 93 y 94") en números individuales.
+    _RE_NUM_SPLIT = re.compile(r"\d+(?:\.\d+)*")
+
+    @staticmethod
+    def _infer_emisora_from_codigo(codigo: str | None) -> str | None:
+        """
+        Infiere institucion_emisora del prefijo del numero_documento.
+        Itera los segmentos separados por '-' y devuelve la primera
+        coincidencia en SIGLAS_INSTITUCIONES.
+
+        Ej.: 'SERCOP-CGAJ-2023-0489-M' → 'Servicio Nacional de
+        Contratación Pública'
+        Soporta también códigos que empiezan con dígitos:
+        '001-CP-DINARP-2025' → 'Dirección Nacional de Registros Públicos'
+        """
+        if not codigo:
+            return None
+        for segment in codigo.split("-"):
+            seg = segment.strip().upper()
+            if seg in _Catalogs.SIGLAS_INSTITUCIONES:
+                return _Catalogs.SIGLAS_INSTITUCIONES[seg]
+        return None
+
+    @staticmethod
+    def _normalize_articulo(val: str) -> str | None:
+        """
+        Forma canónica de un artículo: 'Art. N [calificador]'.
+        Acepta: 'art 71', 'artículo 71', 'Art. 71', 'Art. 303 numeral 4'.
+        Devuelve: 'Art. 71', 'Art. 303 numeral 4'.
+        """
+        m = re.match(
+            r"[Aa]rt(?:[ií]culo)?\.?\s*(\d+(?:\.\d+)*)"
+            r"(?:\s+(numeral|literal|inciso)\s+(\w+))?",
+            val,
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+        num = m.group(1)
+        qual_kind = m.group(2)
+        qual_val = m.group(3)
+        if qual_kind:
+            return f"Art. {num} {qual_kind.lower()} {qual_val}"
+        return f"Art. {num}"
+
     def extract_referencias_split(
         self, text: str
     ) -> tuple[list[str], list[str], list[str], str | None]:
@@ -870,6 +1074,7 @@ class EntityExtractor:
         articulos: list[str] = []
         documentales: list[str] = []
         seen: set[str] = set()
+        articulos_canonicos: set[str] = set()
 
         for m in self._RE_NORM.finditer(text):
             val = " ".join(m.group(0).split())
@@ -877,7 +1082,12 @@ class EntityExtractor:
                 continue
             seen.add(val)
             if self._RE_REF_ART.match(val):
-                articulos.append(val)
+                # Normalizar para deduplicar variantes de formato
+                # ("Art. 71" / "art 71" / "artículo 71" → "Art. 71")
+                canonical = self._normalize_articulo(val) or val
+                if canonical not in articulos_canonicos:
+                    articulos_canonicos.add(canonical)
+                    articulos.append(canonical)
             elif self._RE_REF_DOC.match(val):
                 documentales.append(val)
             else:
@@ -891,6 +1101,62 @@ class EntityExtractor:
                 break
 
         return normativas, articulos, documentales, normativa_principal
+
+    def extract_fundamentos_juridicos(
+        self, text: str, asunto: str | None,
+    ) -> list[FundamentoJuridico]:
+        """
+        Extrae pares artículo + norma en formato compacto ("Art. N SIGLA")
+        listos para indexar en RAG.
+
+        Prioridad por fuente (heurística, sin LLM):
+          - ASUNTO Quipux  -> MEDIA. El redactor coloca aquí las citas que
+            considera relevantes; es señal de importancia del autor.
+          - Cuerpo del documento -> BAJA. Cita contextual / secundaria.
+        El LLM puede luego sobreescribir con ALTA y completar `tema`; el
+        merge en QuipuxPipeline conserva la entrada del LLM (dedup por
+        (articulo, sigla)). Así se evitan prioridades null.
+
+        Solo detecta el patrón compacto con sigla conocida. La forma
+        extendida ("Art. 71 de la Ley Orgánica del Sistema…") y el campo
+        `tema` los completa el LLM si está habilitado.
+
+        Retorna hasta 5 fundamentos deduplicados por (artículo, sigla).
+        """
+        found: dict[tuple[str, str], FundamentoJuridico] = {}
+
+        # (texto fuente, prioridad heurística). El ASUNTO se procesa primero;
+        # el dedup conserva la primera ocurrencia, de modo que un artículo
+        # citado en el asunto Y el cuerpo se queda en MEDIA (señal más fuerte).
+        fuentes: list[tuple[str, str]] = []
+        if asunto:
+            fuentes.append((asunto, "MEDIA"))
+        fuentes.append((text, "BAJA"))
+
+        for fuente, prioridad_fuente in fuentes:
+            for rx in (self._RE_ART_SIGLA, self._RE_NUM_SIGLA):
+                for m in rx.finditer(fuente):
+                    sigla = m.group(2).upper()
+                    norma = _Catalogs.SIGLAS_NORMAS.get(sigla)
+                    # Un match puede traer varios artículos (run "70 y 80")
+                    # que comparten la misma sigla.
+                    for articulo_num in self._RE_NUM_SPLIT.findall(m.group(1)):
+                        articulo = f"Art. {articulo_num}"
+                        cita = f"{articulo} {sigla}"
+                        key = (articulo, sigla)
+                        if key not in found:
+                            found[key] = FundamentoJuridico(
+                                cita=cita,
+                                articulo=articulo,
+                                norma=norma,
+                                sigla=sigla,
+                                tema=None,
+                                prioridad=prioridad_fuente,
+                            )
+                        if len(found) >= 5:
+                            return list(found.values())
+
+        return list(found.values())
 
     # Fechas en el cuerpo (formato largo o numérico)
     _RE_FECHAS_CUERPO = re.compile(
@@ -1079,14 +1345,23 @@ class EntityExtractor:
         normativas, articulos, documentales, normativa_principal = \
             self.extract_referencias_split(text)
         fechas = self.extract_todas_fechas(text)
+        fundamentos = self.extract_fundamentos_juridicos(text, parsed.get("asunto"))
+
+        codigo = self.extract_codigo(text)
+        # Fallback: si el parser estructural no halló institucion_emisora,
+        # inferir del prefijo del código (ej. SERCOP-CGAJ-… → SERCOP).
+        emisora = (
+            parsed.get("institucion_emisora")
+            or self._infer_emisora_from_codigo(codigo)
+        )
 
         return QuipuxMetadata(
             METADATOS=MetadatosBlock(
                 tipo_documento=tipo,
-                numero_documento=self.extract_codigo(text),
+                numero_documento=codigo,
                 fecha_documento=self.extract_fecha(text),
                 asunto=parsed.get("asunto"),
-                institucion_emisora=parsed.get("institucion_emisora"),
+                institucion_emisora=emisora,
                 institucion_destino=parsed.get("institucion_destino"),
                 firmante=parsed.get("firmante"),
                 cargo_firmante=parsed.get("firmante_cargo"),
@@ -1101,6 +1376,7 @@ class EntityExtractor:
                 normativa_principal=normativa_principal,
                 referencias_normativas=normativas,
                 articulos_mencionados=articulos,
+                fundamentos_juridicos=fundamentos,
             ),
             ENTIDADES=EntidadesBlock(
                 personas=personas,
@@ -1141,7 +1417,17 @@ class SemanticExtractor:
   "solicitudes": ["<solicitud explícita 1>"],
   "acciones_requeridas": ["<acción en infinitivo 1>"],
   "problemas_juridicos": ["<cuestión jurídica 1>"],
-  "hechos_relevantes": ["<antecedente o hecho relevante 1>"]
+  "hechos_relevantes": ["<antecedente o hecho relevante 1>"],
+  "fundamentos_juridicos": [
+    {{
+      "cita": "Art. 71 LOSNCP",
+      "articulo": "Art. 71",
+      "norma": "Ley Orgánica del Sistema Nacional de Contratación Pública",
+      "sigla": "LOSNCP",
+      "tema": "Cálculo de multas contractuales",
+      "prioridad": "ALTA"
+    }}
+  ]
 }}
 
 === REGLAS ESTRICTAS POR CAMPO ===
@@ -1192,7 +1478,180 @@ CAMPO: problemas_juridicos
   Controversias, cuestiones de derecho o inconsistencias normativas planteadas.
 
 CAMPO: hechos_relevantes
-  Antecedentes o circunstancias factuales mencionadas en el documento.
+  Definicion: Antecedentes factuales o circunstancias concretas que sustentan
+  el contenido del documento. Acontecimientos, no opiniones ni solicitudes.
+
+  Criterios de calidad por hecho:
+    - Especifico: incluye referencias concretas (numeros de documento, fechas,
+      autoridades involucradas) cuando el texto las provea.
+    - Autocontenido: legible sin necesidad de leer el documento completo.
+    - Factual: describe algo que ocurrio o existe, no algo que se pide
+      ni una controversia juridica.
+
+  Que SI cuenta como hecho relevante:
+    - Documentos previos referenciados con su numero y fecha
+      (oficios, memorandos, informes, dictamenes, resoluciones, sentencias).
+    - Actos administrativos previos que enmarcan el caso
+      (decretos, acuerdos ministeriales, resoluciones).
+    - Hechos concretos del expediente con fecha o datos especificos.
+    - Pronunciamientos institucionales previos sobre la materia.
+
+  Que NO cuenta (va en otro campo):
+    - Lo que el emisor pide o solicita          -> solicitudes
+    - Cuestiones de derecho o controversias     -> problemas_juridicos
+    - Pasos que el destinatario debe ejecutar   -> acciones_requeridas
+    - Citas de articulos sueltas                -> fundamentos_juridicos
+
+  Cantidad: extrae TODOS los hechos relevantes que el documento contenga,
+  sin tope artificial. No infles con detalles triviales ni omitas hechos
+  centrales por brevedad. La calidad es el criterio, no la cantidad.
+
+  INCORRECTO (pocos y genericos):
+    ["Hubo una consulta previa", "Existe un dictamen anterior"]
+  CORRECTO (especificos y referenciados):
+    ["Consulta original presentada mediante Oficio Nro. XXX-2023-001 de 5 de
+      marzo de 2023 por el Director Nacional de la entidad consultante",
+     "Dictamen previo de la Procuraduria General del Estado en Oficio
+      Nro. PGE-12208 de 22 de septiembre de 2017",
+     "Reforma normativa introducida por Decreto Ejecutivo No. 550 publicado
+      el 31 de agosto de 2022"]
+
+CAMPO: fundamentos_juridicos
+  Definicion: Articulos juridicos CENTRALES que sustentan el criterio o
+              decision principal del documento. NO toda cita normativa.
+  Formato: lista de objetos. MAXIMO 3 items, ordenados por importancia.
+
+  Estructura de cada item:
+    - "cita":     formato compacto "Art. N SIGLA" para indexacion RAG.
+                  Ej.: "Art. 71 LOSNCP", "Art. 14 COA", "Art. 226 CRE".
+    - "articulo": "Art. N" (sin sigla). Ej.: "Art. 71".
+    - "norma":    nombre completo y oficial de la ley/codigo/constitucion.
+                  Ej.: "Ley Organica del Sistema Nacional de Contratacion Publica".
+    - "sigla":    acronimo oficial. Ej.: "LOSNCP", "COA", "COIP", "CRE",
+                  "LOSEP", "RGLOSNCP", "CC", "CT".
+    - "tema":     que regula ese articulo EN EL CONTEXTO del documento.
+                  Frase nominal breve (max 10 palabras).
+    - "prioridad": nivel de relevancia juridica del fundamento frente al
+                   PROBLEMA JURIDICO PRINCIPAL del tramite.
+                   Valores: "ALTA" | "MEDIA" | "BAJA".
+                   REGLA DURA: como MAXIMO UN (1) fundamento puede ser
+                   "ALTA" — el unico que resuelve el problema central.
+                   El resto es "MEDIA" o "BAJA". (Ver PRIORIZACION).
+
+  PRIORIZACION JURIDICA (campo "prioridad"):
+    CARDINALIDAD (regla maxima, no negociable): SOLO UN fundamento de toda
+    la lista puede llevar "ALTA". Es el que aborda y resuelve el problema
+    juridico central. Todos los demas son "MEDIA" (aportan contexto) o
+    "BAJA" (menor impacto al problema principal). Si dudas entre dos
+    candidatos a ALTA, elige UNO solo (el mas especifico/operativo) y baja
+    el otro a "MEDIA". Si ninguno resuelve el conflicto, NO marques ALTA.
+
+    NO priorices por orden de aparicion ni por prominencia en el texto.
+    Los articulos citados en los "vistos"/"considerandos" como marco
+    institucional (competencia, atribuciones, ambito) aparecen primero y
+    muchas veces, pero casi NUNCA son el fundamento central. Ignora esa
+    prominencia y evalua la relacion SEMANTICA con el conflicto, ponderando:
+      1. problemas_juridicos detectados (el conflicto central a resolver).
+      2. tema asociado al propio fundamento.
+      3. objeto_tramite.
+      4. contexto general del asunto.
+
+    REGLA DE ORO para marcar "ALTA" — aplica este test SIEMPRE:
+      Preguntate: "¿Este articulo contiene la REGLA OPERATIVA CONCRETA
+      (formula de calculo, procedimiento, condicion de aplicacion o regla
+      de decision) que RESUELVE el problema_juridico, o solo HABILITA la
+      figura juridica / dice QUIEN tiene competencia / cual es el AMBITO /
+      definiciones / principios generales?"
+      Si solo habilita una potestad ("habra multas", "podra sancionarse"),
+      describe competencia, atribuciones, ambito, objeto, definiciones o
+      principios -> NO es ALTA (va MEDIA o BAJA), aunque encabece el
+      documento o se repita muchas veces.
+
+    CRITERIO DE ESPECIFICIDAD OPERATIVA (criterio A):
+      ALTA exige el COMO concreto del caso: la formula, el procedimiento,
+      los plazos, la condicion de aplicacion o la regla de decision
+      aplicable al problema central. Un articulo que solo establece QUE
+      EXISTE la figura juridica, sin decir COMO aplicarla, es MEDIA aunque
+      sea el origen normativo de la figura discutida.
+
+    NUNCA marques ALTA (van BAJA) los articulos cuyo tema sea:
+      - Atribuciones / facultades / competencias de un organo
+        (p. ej. "Atribuciones del SERCOP").
+      - Ambito de aplicacion u objeto/fines de la ley.
+      - Definiciones o glosario.
+      - Principios generales o fines institucionales.
+      - Creacion o estructura organica de una entidad.
+
+    REGLA LEY MARCO vs REGLAMENTO OPERATIVO (criterio B):
+      Cuando coexisten en el documento una LEY y su REGLAMENTO regulando
+      la misma materia, distingue el rol normativo de cada uno:
+        - La LEY normalmente HABILITA la figura juridica (establece que
+          existe, fija el marco general): por defecto es MEDIA.
+        - El REGLAMENTO normalmente OPERATIVIZA esa figura (formula de
+          calculo, procedimiento, plazos, porcentajes, condiciones de
+          aplicacion): es el candidato natural a ALTA si contiene la regla
+          concreta del caso.
+      Aplica este criterio a CUALQUIER par ley + reglamento (no solo
+      LOSNCP/RGLOSNCP: tambien LOSEP/RGLOSEP, LOES/RGLOES, LOSNS/RGLOSNS,
+      etc.).
+      EJEMPLO: si el documento discute COMO se calculan multas y aparecen
+      el articulo de la LEY que dice "habra multas por mora" y el del
+      REGLAMENTO que da el porcentaje/dia y la base de calculo, el de la
+      LEY es MEDIA y el del REGLAMENTO es ALTA.
+      Excepcion: si la LEY misma contiene la formula o el procedimiento
+      operativo aplicable al caso, entonces la LEY SI es ALTA.
+
+    Niveles:
+      - "ALTA":  EXACTAMENTE UNO en toda la lista. Es el UNICO articulo que
+                 contiene la regla operativa concreta (formula, procedimiento,
+                 condicion o regla de decision) que RESUELVE el problema
+                 juridico central. Si hay dos candidatos, gana el mas
+                 especifico y el otro pasa a MEDIA. Ante la duda, usa MEDIA.
+      - "MEDIA": aporta contexto normativo complementario. Puede haber varios.
+      - "BAJA":  referencia secundaria, institucional, competencial, de
+                 ambito o introductoria. Puede haber varios.
+
+    EJEMPLO (problema: "inexistencia de figura para agregar dias de
+    suspension al plazo total del contrato"):
+      - "Art. 10 LOSNCP" (Atribuciones del SERCOP)            -> "BAJA"
+        Solo dice QUIEN tiene competencia. NO resuelve el conflicto.
+        Aunque encabece los considerandos, NUNCA es ALTA.
+      - "Art. 9 LOSNCP" (Objeto / fines del Sistema)          -> "BAJA"
+        Es declarativo/institucional, no normativo del caso.
+      - "Art. 121 RGLOSNCP" (Suspension del plazo contractual) -> "ALTA"
+        Contiene la regla que resuelve directamente el conflicto.
+      - "Art. 80 LOSNCP" (Responsable de la administracion)   -> "MEDIA"
+        Aplicable al contexto pero no resuelve el nucleo.
+
+  PROHIBIDO:
+    - Incluir TODAS las citas mencionadas en el documento.
+    - Inventar siglas que no esten oficialmente reconocidas.
+    - Dejar "cita" sin sigla si la sigla es conocida.
+    - Repetir el mismo (articulo, sigla) en mas de un item.
+
+  EJEMPLO (memorando sobre multas en contratacion publica):
+    Un solo ALTA: la LEY habilita la figura (MEDIA) y el REGLAMENTO
+    aporta la regla operativa que resuelve el caso (ALTA).
+    "fundamentos_juridicos": [
+      {{
+        "cita": "Art. 292 RGLOSNCP",
+        "articulo": "Art. 292",
+        "norma": "Reglamento General a la Ley Organica del Sistema Nacional de Contratacion Publica",
+        "sigla": "RGLOSNCP",
+        "tema": "Formula y porcentaje de calculo de multas por mora",
+        "prioridad": "ALTA"
+      }},
+      {{
+        "cita": "Art. 71 LOSNCP",
+        "articulo": "Art. 71",
+        "norma": "Ley Organica del Sistema Nacional de Contratacion Publica",
+        "sigla": "LOSNCP",
+        "tema": "Existencia de multas por incumplimiento contractual",
+        "prioridad": "MEDIA"
+      }}
+    ]
+
+  Si no hay ningun articulo central identificable, devuelve [].
 
 === REGLAS GLOBALES ===
 - Responde UNICAMENTE con el JSON. Sin markdown, sin texto adicional.
@@ -1212,6 +1671,7 @@ TEXTO DEL DOCUMENTO:
         "acciones_requeridas": [],
         "problemas_juridicos": [],
         "hechos_relevantes": [],
+        "fundamentos_juridicos": [],
     }
 
     def __init__(self, provider: str = "openai", use_azure: bool = False):
@@ -1240,14 +1700,14 @@ TEXTO DEL DOCUMENTO:
                         ),
                         azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
                     )
-                    self._model = os.environ.get("QUIPUX_LLM_MODEL", "gpt-4o-mini")
+                    self._model = os.environ.get("QUIPUX_LLM_MODEL", "gpt-4o")
                     log.info("SemanticExtractor: AzureOpenAI listo (deployment=%s)",
                              self._model)
                 else:
                     self.client = openai.OpenAI(
                         api_key=os.environ.get("OPENAI_API_KEY"),
                     )
-                    self._model = os.environ.get("QUIPUX_LLM_MODEL", "gpt-4o-mini")
+                    self._model = os.environ.get("QUIPUX_LLM_MODEL", "gpt-4o")
                     log.info("SemanticExtractor: OpenAI listo (model=%s)", self._model)
             except Exception as e:
                 log.error("SemanticExtractor: error inicializando cliente OpenAI: %s", e)
@@ -1274,11 +1734,19 @@ TEXTO DEL DOCUMENTO:
         else:
             log.error("SemanticExtractor: provider desconocido '%s'", self.provider)
 
-    def extract(self, text: str, max_chars: int = 6000) -> dict:
-        """Llama al LLM y retorna dict con los 5 campos semánticos."""
+    def extract(self, text: str, max_chars: int | None = None) -> dict:
+        """Llama al LLM y retorna dict con los 5 campos semánticos.
+
+        max_chars controla cuánto texto ve el LLM. 6000 chars solo cubría
+        el encabezado + considerandos (preámbulo institucional), dejando
+        fuera el análisis jurídico donde se discuten los artículos que
+        regulan el conflicto. Default 16000; override con QUIPUX_LLM_MAX_CHARS.
+        """
         if self.client is None:
             return dict(self._FALLBACK)
 
+        if max_chars is None:
+            max_chars = int(os.getenv("QUIPUX_LLM_MAX_CHARS", "16000"))
         texto_truncado = text[:max_chars]
         prompt = self._PROMPT_USUARIO.format(texto=texto_truncado)
 
@@ -1291,14 +1759,16 @@ TEXTO DEL DOCUMENTO:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0,
+                    seed=7,  # reproducibilidad best-effort (OpenAI no es
+                             # determinista a temp=0 sin seed fijo)
                     response_format={"type": "json_object"},
-                    max_tokens=800,
+                    max_tokens=1200,
                 )
                 raw = resp.choices[0].message.content
             elif self.provider == "anthropic":
                 resp = self.client.messages.create(
                     model=self._model,
-                    max_tokens=800,
+                    max_tokens=1200,
                     system=self._PROMPT_SISTEMA,
                     messages=[{"role": "user", "content": prompt}],
                 )
@@ -1390,7 +1860,146 @@ class QuipuxPipeline:
             metadata.CONTENIDO_FUNCIONAL.problemas_juridicos = sem["problemas_juridicos"]
             metadata.CONTENIDO_FUNCIONAL.hechos_relevantes = sem["hechos_relevantes"]
 
+            # fundamentos_juridicos: MERGE regex + LLM.
+            # - Regex garantiza cobertura de citas centrales (especialmente
+            #   las que el redactor puso en el ASUNTO).
+            # - LLM aporta `tema` enriquecido y orden por importancia.
+            # Dedup por (articulo, sigla). LLM primero para preservar
+            # su ranking de relevancia. Cap a 5 para RAG manejable.
+            llm_funds = self._validate_fundamentos(sem.get("fundamentos_juridicos"))
+            merged: list[FundamentoJuridico] = []
+            seen: set[tuple[str, str | None]] = set()
+            for f in llm_funds:
+                key = (f.articulo, f.sigla)
+                if key not in seen:
+                    merged.append(f)
+                    seen.add(key)
+            for f in metadata.NORMATIVA.fundamentos_juridicos:
+                key = (f.articulo, f.sigla)
+                if key not in seen:
+                    merged.append(f)
+                    seen.add(key)
+            # Regla de negocio (garantia dura): un unico fundamento ALTA.
+            # Se aplica ANTES de ordenar para que el ALTA conservado sea el
+            # primero en el ranking de relevancia del LLM; los demas ALTA se
+            # degradan a MEDIA. Asi el prompt orienta y el guard garantiza.
+            self._enforce_single_alta(merged)
+            # Reordenar por prioridad juridica: ALTA -> MEDIA -> BAJA -> null.
+            # sort estable: dentro de igual prioridad se preserva el orden de
+            # merge (ranking del LLM primero, fundamentos solo-regex despues).
+            # Cap a 5 DESPUES de ordenar para que ningun ALTA se pierda frente
+            # a un BAJA/null. Los solo-regex llegan con prioridad=None (rank 3).
+            _rank = {"ALTA": 0, "MEDIA": 1, "BAJA": 2}
+            merged.sort(key=lambda f: _rank.get(f.prioridad, 3))
+            metadata.NORMATIVA.fundamentos_juridicos = merged[:5]
+
         return QuipuxDocument(fuente=str(pdf_path), metadata=metadata)
+
+    @staticmethod
+    def _enforce_single_alta(funds: list[FundamentoJuridico]) -> None:
+        """
+        Garantiza que como máximo UN fundamento tenga prioridad ALTA.
+
+        Regla de negocio: solo el fundamento que aborda y resuelve el
+        problema jurídico central puede ser ALTA. El prompt ya lo pide,
+        pero si el LLM devuelve varios ALTA (alucinación) este guard
+        conserva el primero —el de mayor relevancia según el orden de
+        entrada (ranking del LLM)— y degrada el resto a MEDIA.
+
+        Modifica la lista in-place. Llamar ANTES de ordenar por prioridad
+        para que el ALTA conservado sea el mejor ranqueado.
+        """
+        visto_alta = False
+        for f in funds:
+            if f.prioridad == "ALTA":
+                if visto_alta:
+                    f.prioridad = "MEDIA"
+                else:
+                    visto_alta = True
+
+    @staticmethod
+    def _norm_cmp(s: str) -> str:
+        """Normaliza para comparar: sin acentos, minúsculas, espacios colapsados."""
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        return " ".join(s.lower().split())
+
+    @staticmethod
+    def _resolve_sigla(
+        sigla: str | None, norma: str | None
+    ) -> tuple[str | None, str | None]:
+        """
+        Resuelve (sigla, norma) contra el catálogo controlado, que es la
+        FUENTE DE VERDAD. Evita siglas alucinadas por el LLM en el RAG.
+
+          1. Si la sigla del LLM ya es oficial -> se usa, y la norma se
+             normaliza al nombre canónico del catálogo.
+          2. Si no, se intenta recuperar la sigla por el NOMBRE de la norma
+             (reverse-lookup sin acentos). Ej.: el LLM pone "COFPP" pero
+             norma="Código Orgánico de Planificación..." -> "COPLAFIP".
+          3. Si nada coincide, se descarta la sigla (None) y se conserva la
+             norma del LLM tal cual.
+        """
+        catalogo = _Catalogs.SIGLAS_NORMAS
+        if sigla and sigla in catalogo:
+            return sigla, catalogo[sigla]
+        if norma:
+            objetivo = QuipuxPipeline._norm_cmp(norma)
+            for sig, nombre in catalogo.items():
+                if QuipuxPipeline._norm_cmp(nombre) == objetivo:
+                    return sig, nombre
+        return None, (norma or None)
+
+    @staticmethod
+    def _validate_fundamentos(raw) -> list[FundamentoJuridico]:
+        """
+        Convierte la lista de dicts del LLM en FundamentoJuridico validados.
+        Descarta items inválidos. Limita a 3.
+
+        La identidad normativa (sigla + norma) se ancla al catálogo: ninguna
+        sigla inventada por el LLM llega a la salida. La `cita` se reconstruye
+        a partir del artículo + sigla canónica para mantener consistencia RAG.
+        """
+        if not isinstance(raw, list):
+            return []
+        result: list[FundamentoJuridico] = []
+        seen: set[tuple[str, str | None]] = set()
+        for item in raw[:5]:  # leemos hasta 5, devolvemos hasta 3 válidos
+            if not isinstance(item, dict):
+                continue
+            articulo = item.get("articulo")
+            if not (isinstance(articulo, str) and articulo.strip()):
+                continue
+            articulo = articulo.strip()
+            sigla_raw = item.get("sigla") if isinstance(item.get("sigla"), str) else None
+            norma_raw = item.get("norma") if isinstance(item.get("norma"), str) else None
+            sigla, norma = QuipuxPipeline._resolve_sigla(
+                sigla_raw.strip().upper() if sigla_raw else None,
+                norma_raw.strip() if norma_raw else None,
+            )
+            tema = item.get("tema") if isinstance(item.get("tema"), str) else None
+            prioridad_raw = item.get("prioridad")
+            prioridad = None
+            if isinstance(prioridad_raw, str):
+                p = prioridad_raw.strip().upper()
+                prioridad = p if p in ("ALTA", "MEDIA", "BAJA") else None
+            # cita canónica: nunca arrastra una sigla inventada.
+            cita = f"{articulo} {sigla}" if sigla else articulo
+            key = (articulo, sigla)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(FundamentoJuridico(
+                cita=cita,
+                articulo=articulo,
+                norma=norma,
+                sigla=sigla,
+                tema=tema.strip() if tema else None,
+                prioridad=prioridad,
+            ))
+            if len(result) >= 3:
+                break
+        return result
 
     def process_and_save(
         self,

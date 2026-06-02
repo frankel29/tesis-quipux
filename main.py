@@ -24,7 +24,7 @@ Variables de entorno
   API_KEY               clave Bearer        (default: desactivado)
   QUIPUX_LOAD_LLM       true | false        (default: false)
   QUIPUX_LLM_PROVIDER   openai | anthropic  (default: openai)
-  QUIPUX_LLM_MODEL      modelo o deployment (default: gpt-4o-mini)
+  QUIPUX_LLM_MODEL      modelo o deployment (default: gpt-4o)
   QUIPUX_LLM_USE_AZURE  true | false        (default: false)
   OPENAI_API_KEY        API key OpenAI directa
   AZURE_OPENAI_ENDPOINT endpoint Azure OpenAI
@@ -117,9 +117,10 @@ app = FastAPI(
     title="Quipux NER API",
     description=(
         "Extracción de entidades nombradas en documentos PDF Quipux/SERCOP. "
-        "Schema de salida v6: METADATOS, CONTENIDO_FUNCIONAL, NORMATIVA, ENTIDADES."
+        "Schema v6.2: METADATOS, CONTENIDO_FUNCIONAL, NORMATIVA (con "
+        "fundamentos_juridicos y prioridad ALTA/MEDIA/BAJA), ENTIDADES."
     ),
-    version="6.0.0",
+    version="6.2.0",
     lifespan=lifespan,
 )
 
